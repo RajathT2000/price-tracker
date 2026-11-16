@@ -26,6 +26,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(t, "DB", tmp_path / "p.db")
     monkeypatch.setattr(t, "LOG", tmp_path / "alerts.log")
     monkeypatch.setattr(t, "PRODUCTS", tmp_path / "products.txt")
+    monkeypatch.setattr(t, "HISTORY", tmp_path / "history.csv")
     monkeypatch.delenv("NTFY_TOPIC", raising=False)
     cfg = tmp_path / "c.json"
     cfg.write_text('{"desktop": false}')
@@ -356,3 +357,77 @@ def test_name_only_product_ignores_other_country_prices(env, monkeypatch):
     conn.execute("INSERT INTO products(query,every) VALUES('Sony WH-1000XM5','day')"); conn.commit()
     results, _ = t.check(conn, conn.execute("SELECT * FROM products").fetchone())
     assert [(r["price"], r["currency"]) for r in results] == [(420, "AUD")]
+
+
+# --- every check is saved (time, site, price, details, result) ---
+def test_every_site_checked_is_saved(env, monkeypatch):
+    listing = "https://store-d.com/search?q=sony"
+    blocked_url = "https://store-e.com/p/sony-wh-1000xm5"
+    env[ORIG] = ld_page("Sony WH-1000XM5", 399, was=449)
+    env[OTHER] = ld_page("Sony WH-1000XM5", 349)
+    env[WRONG] = ld_page("Sony WH-1000XM4", 199)
+    monkeypatch.setattr(t, "search", lambda q, n=10: [ORIG, OTHER, WRONG, listing, blocked_url])
+    conn = t.connect()
+    p = add(conn)
+    t.check(conn, p)
+    rows = {r["site"]: r for r in conn.execute("SELECT * FROM checks")}
+    assert rows["shop-a.com"]["status"] == "price found" and rows["shop-a.com"]["price"] == 399
+    assert rows["shop-a.com"]["was"] == 449 and "11% off" in rows["shop-a.com"]["offer"]
+    assert rows["shop-a.com"]["source"] == "original" and rows["shop-a.com"]["ts"]
+    assert rows["store-b.com"]["status"] == "price found" and rows["store-b.com"]["price"] == 349
+    assert rows["store-c.com"]["status"] == "different product" and rows["store-c.com"]["price"] == 199
+    assert rows["store-d.com"]["status"] == "skipped: search/category page"
+    assert rows["store-e.com"]["status"] == "blocked / unreachable"
+    t.check(conn, reload(conn, p["id"]))  # second check saved too, even with same prices
+    assert conn.execute("SELECT COUNT(DISTINCT ts) FROM checks").fetchone()[0] >= 1
+    assert conn.execute("SELECT COUNT(*) FROM checks").fetchone()[0] == 10
+
+
+def test_failed_check_is_still_saved(env):
+    conn = t.connect()
+    t.check(conn, add(conn))
+    statuses = [r["status"] for r in conn.execute("SELECT status FROM checks")]
+    assert statuses == ["blocked / unreachable"] * 3  # original + 2 other stores, all saved
+
+
+def test_watch_checks_saved_every_time(env):
+    env[FEED_APPLE] = rss(("1", "AirPods Max $549 @ JB Hi-Fi", "https://www.jbhifi.com.au/p", False),
+                          ("2", "iPad $399 @ Big W", "https://www.bigw.com.au/p", True))
+    t.PRODUCTS.write_text("watch: apple | hour\n")
+    conn = t.connect(); t.sync(conn)
+    p = conn.execute("SELECT * FROM products").fetchone()
+    t.check_watch(conn, p); t.check_watch(conn, reload(conn, p["id"]))
+    rows = [tuple(r) for r in conn.execute("SELECT site, status, price FROM checks ORDER BY id")]
+    assert rows == [("jbhifi.com.au", "new deal", 549.0), ("bigw.com.au", "expired deal", 399.0),
+                    ("jbhifi.com.au", "deal already seen", 549.0), ("bigw.com.au", "expired deal", 399.0)]
+
+
+def test_history_csv_and_command(env, capsys):
+    import csv
+    env[ORIG] = ld_page("Sony WH-1000XM5", 399, was=449)
+    t.PRODUCTS.write_text(f"{ORIG} | hour\n")
+    t.main(["check"])
+    rows = [r for r in csv.DictReader(open(t.HISTORY)) if r["site"] == "shop-a.com"]
+    assert rows[0]["site"] == "shop-a.com" and rows[0]["price"] == "399.00" and rows[0]["was"] == "449.00"
+    assert rows[0]["result"] == "price found" and rows[0]["link"] == ORIG and rows[0]["time"]
+    assert rows[0]["product"] == "Sony WH-1000XM5" and "11% off" in rows[0]["offer / deal"]
+    capsys.readouterr()
+    t.main(["history", "1"])
+    out = capsys.readouterr().out
+    assert "shop-a.com" in out and "price found" in out and "399.00" in out
+
+
+def test_workflow_saves_history_even_without_alerts_file():
+    wf = (t.HERE / ".github/workflows/track.yml").read_text()
+    assert 'for f in prices.db alerts.log products.txt history.csv; do [ -e "$f" ] && git add "$f"; done' in wf
+    assert "TZ: Australia/Sydney" in wf and "COUNTRY: AU" in wf
+
+
+def test_search_drops_junk_results(monkeypatch):
+    junk = """<li class="b_algo"><h2><a href="https://mail.google.com/">Gmail</a></h2></li>
+    <li class="b_algo"><h2><a href="https://allrecipes.com/x">Best pancake recipe</a></h2></li>
+    <li class="b_algo"><h2><a href="https://www.umart.com.au/product/apple-airpods-pro-2nd-gen">Apple AirPods Pro 2nd Gen</a></h2></li>
+    <li class="b_algo"><h2><a href="https://www.jbhifi.com.au/products/apple-airpods-pro-2">Buy now | JB Hi-Fi</a></h2></li>"""
+    monkeypatch.setattr(t, "fetch", lambda url, data=None, headers=None: None if "duckduckgo" in url else junk)
+    assert REAL_SEARCH("AirPods Pro 2nd Generation price") == [
+        "https://www.umart.com.au/product/apple-airpods-pro-2nd-gen", "https://www.jbhifi.com.au/products/apple-airpods-pro-2"]

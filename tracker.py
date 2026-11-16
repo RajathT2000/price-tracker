@@ -2,6 +2,7 @@
 """Free price tracker: original page price, offers, cheaper elsewhere, history, alerts."""
 import argparse
 import base64
+import csv
 import json
 import os
 import re
@@ -22,6 +23,7 @@ HERE = Path(__file__).resolve().parent
 DB = HERE / "prices.db"
 CONFIG = HERE / "config.json"
 LOG = HERE / "alerts.log"
+HISTORY = HERE / "history.csv"  # every check: time, site, price, offer, result, link
 PRODUCTS = HERE / "products.txt"  # one product per line: <link or name> | hour|day
 INTERVALS = {"hour": 3600, "day": 86400}
 SLACK = 300  # run a few minutes early so an hourly scheduler never skips a slot
@@ -54,6 +56,9 @@ def connect():
     conn.row_factory = sqlite3.Row
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS seen(watch TEXT, guid TEXT, PRIMARY KEY(watch, guid));
+    CREATE TABLE IF NOT EXISTS checks(
+        id INTEGER PRIMARY KEY, product_id INTEGER, ts TEXT, site TEXT, url TEXT, status TEXT,
+        price REAL, currency TEXT, offer TEXT, was REAL, page_title TEXT, source TEXT);
     CREATE TABLE IF NOT EXISTS products(
         id INTEGER PRIMARY KEY, query TEXT, url TEXT, name TEXT,
         every TEXT DEFAULT 'day', last_checked REAL DEFAULT 0,
@@ -238,8 +243,21 @@ def extract(html):
 
 
 # ---------- searching other stores ----------
+GENERIC = {"price", "prices", "buy", "cheap", "best", "deal", "deals", "sale", "online", "australia", "with", "and",
+           "the", "for", "new"}
+
+
+def relevant(query, title, url):
+    """Drop junk search results whose title/link don't mention the product."""
+    key = tokens(query) - GENERIC
+    if not key:
+        return True
+    hit = key & (tokens(title) | tokens(urllib.parse.unquote(url).replace("-", " ").replace("_", " ")))
+    return len(hit) >= min(2, len(key))
+
+
 def search(query, n=10):
-    urls = []
+    found = []  # (url, title)
     c = country()
     ddg = {"q": query}
     if c in DDG_REGION:
@@ -251,18 +269,18 @@ def search(query, n=10):
             if "uddg=" in href:
                 href = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)["uddg"][0]
             if href.startswith("http") and "duckduckgo.com" not in href:
-                urls.append(href)
-    if not urls:
+                found.append((href, a.get_text(" ", strip=True)))
+    if not found:
         region = f"&cc={c}&mkt=en-{c}&setlang=en-{c}" if c else ""
         html = fetch("https://www.bing.com/search?q=" + urllib.parse.quote(query) + region)
         if html:
             for a in BeautifulSoup(html, "html.parser").select("li.b_algo h2 a"):
                 href = bing_target(a.get("href", ""))
                 if href.startswith("http"):
-                    urls.append(href)
+                    found.append((href, a.get_text(" ", strip=True)))
     seen, out = set(), []
-    for u in urls:
-        if u not in seen:
+    for u, title in found:
+        if u not in seen and relevant(query, title, u):
             seen.add(u)
             out.append(u)
     return out[:n]
@@ -352,6 +370,13 @@ def check(conn, p):
     now = datetime.now().isoformat(timespec="seconds")
     results, orig = [], None
     name = p["name"] or (url_name(p["url"]) if p["url"] and p["query"] == p["url"] else p["query"])
+    log = []  # every site looked at in this check, saved to the checks table
+
+    def note(url, status, info=None, source="other"):
+        info = info or {}
+        log.append((url, status, info.get("price"), info.get("currency"), info.get("offer"),
+                    info.get("was"), (info.get("name") or "")[:200], source))
+
     if p["url"]:
         html = fetch(p["url"])
         info = extract(html) if html else {}
@@ -361,6 +386,8 @@ def check(conn, p):
             orig = {"store": domain(p["url"]), "url": p["url"], "price": info["price"],
                     "currency": info.get("currency"), "offer": info.get("offer"), "source": "original"}
             results.append(orig)
+        note(p["url"], "price found" if orig else ("no price on page" if html else "blocked / unreachable"),
+             info, "original")
     tried = 0
     queries = [short_name(name) + " price", short_name(name, 5) + " price"]
     if not re.match(r"https?://", p["query"] or ""):
@@ -368,24 +395,36 @@ def check(conn, p):
     urls = []
     for q in dict.fromkeys(queries):
         urls += [u for u in search(q) if u not in urls]
+    if not urls:
+        note(None, "no search results")
     for u in urls:
-        if (p["url"] and domain(u) == domain(p["url"])) or is_listing(u):
+        if p["url"] and domain(u) == domain(p["url"]):
+            continue
+        if is_listing(u):
+            note(u, "skipped: search/category page")
             continue
         if tried >= MAX_OTHER_PAGES:
             break
         tried += 1
         html = fetch(u)
         if not html:
+            note(u, "blocked / unreachable")
             continue
         info = extract(html)
-        if (not info.get("price") or is_listing(u, info.get("name"))
-                or not same_product(short_name(name, 12), info.get("name"))):
-            continue
         want = (orig and orig["currency"]) or COUNTRY_CURRENCY.get(country())
-        if want and info.get("currency") and info["currency"] != want:
-            continue
-        results.append({"store": domain(u), "url": u, "price": info["price"], "currency": info.get("currency"),
-                        "offer": info.get("offer"), "source": "other"})
+        if not info.get("price"):
+            note(u, "no price on page", info)
+        elif is_listing(u, info.get("name")):
+            note(u, "skipped: search/category page", info)
+        elif not same_product(short_name(name, 12), info.get("name")):
+            note(u, "different product", info)
+        elif want and info.get("currency") and info["currency"] != want:
+            note(u, f"other currency ({info['currency']})", info)
+        else:
+            note(u, "price found", info)
+            results.append({"store": domain(u), "url": u, "price": info["price"], "currency": info.get("currency"),
+                            "offer": info.get("offer"), "source": "other"})
+    save_checks(conn, p["id"], now, log)
 
     prev_low = conn.execute("SELECT MIN(price) FROM prices WHERE product_id=?", (p["id"],)).fetchone()[0]
     for r in results:
@@ -453,6 +492,7 @@ def sync(conn):
     for q, r in have.items():
         if q not in wanted:
             conn.execute("DELETE FROM prices WHERE product_id=?", (r["id"],))
+            conn.execute("DELETE FROM checks WHERE product_id=?", (r["id"],))
             conn.execute("DELETE FROM products WHERE id=?", (r["id"],))
     conn.commit()
 
@@ -500,6 +540,28 @@ def deal_store(title, url):
     return m.group(1) if m else domain(url)
 
 
+def save_checks(conn, pid, ts, log):
+    conn.executemany("INSERT INTO checks(product_id,ts,site,url,status,price,currency,offer,was,page_title,source)"
+                     " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                     [(pid, ts, domain(u) if u else None, u, *rest) for u, *rest in log])
+
+
+def export_history(conn, limit=3000):
+    """history.csv: newest first, one row per site per check (GitHub shows it as a table)."""
+    rows = conn.execute("""SELECT c.ts, COALESCE(p.name, p.query) AS product, c.site, c.price, c.currency, c.was,
+                           c.offer, c.status, c.source, c.page_title, c.url
+                           FROM checks c LEFT JOIN products p ON p.id = c.product_id
+                           ORDER BY c.ts DESC, c.id DESC LIMIT ?""", (limit,)).fetchall()
+    with open(HISTORY, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["time", "product", "site", "price", "currency", "was", "offer / deal", "result", "type",
+                    "page title", "link"])
+        for r in rows:
+            w.writerow([r["ts"], r["product"], r["site"] or "", "" if r["price"] is None else f"{r['price']:.2f}",
+                        r["currency"] or "", "" if r["was"] is None else f"{r['was']:.2f}", r["offer"] or "",
+                        r["status"], r["source"], r["page_title"] or "", r["url"] or ""])
+
+
 def check_watch(conn, p):
     """Alert on every new deal matching the keyword (e.g. 'watch: apple')."""
     keyword = p["query"].split(":", 1)[1].strip()
@@ -516,6 +578,17 @@ def check_watch(conn, p):
     new = [it for it in items if not it["expired"] and not conn.execute(
         "SELECT 1 FROM seen WHERE watch=? AND guid=?", (p["query"], it["guid"])).fetchone()]
     now = datetime.now().isoformat(timespec="seconds")
+    new_guids = {it["guid"] for it in new}
+    log = []
+    for it in items:
+        link = it["store_url"] or it["link"]
+        price, _ = parse_price((re.search(r"\$\s?[\d,]+(?:\.\d+)?", it["title"]) or [None])[0])
+        status = "new deal" if it["guid"] in new_guids else ("expired deal" if it["expired"] else "deal already seen")
+        log.append((link, status, price, COUNTRY_CURRENCY.get(country() or "AU"), it["title"], None,
+                    it["title"][:200], "deal"))
+    if not items:
+        log.append((None, "no matching deals in feed", None, None, None, None, "", "deal"))
+    save_checks(conn, p["id"], now, log)
     alerts = []
     for i, it in enumerate(new):
         link = it["store_url"] or it["link"]
@@ -565,6 +638,7 @@ def cmd_add(conn, a):
     p = conn.execute("SELECT * FROM products WHERE id=?", (cur.lastrowid,)).fetchone()
     results, _ = (check_watch if is_watch(target) else check)(conn, p)
     p = conn.execute("SELECT * FROM products WHERE id=?", (cur.lastrowid,)).fetchone()
+    export_history(conn)
     print(f"Added #{p['id']}: {p['name']} (every {p['every']})")
     print(f"  page: {p['url'] or 'none found, tracking by name'}")
     for r in sorted(results, key=lambda r: r["price"]):
@@ -585,10 +659,10 @@ def cmd_list(conn, a):
 
 
 def cmd_history(conn, a):
-    rows = conn.execute("SELECT ts,store,price,currency,offer,url FROM prices WHERE product_id=? ORDER BY ts, price",
-                        (a.id,)).fetchall()
+    rows = conn.execute("SELECT * FROM checks WHERE product_id=? ORDER BY ts, id", (a.id,)).fetchall()
     for r in rows:
-        print(f"{r['ts']}  {r['currency'] or '':>3} {r['price']:>10,.2f}  {r['store']:<25} {r['offer'] or ''}")
+        price = f"{r['currency'] or '':>3} {r['price']:>10,.2f}" if r["price"] is not None else " " * 14
+        print(f"{r['ts']}  {price}  {(r['site'] or '-'):<25} {r['status']:<28} {r['offer'] or ''}")
     if not rows:
         print("no history")
 
@@ -604,6 +678,7 @@ def cmd_check(conn, a):
                 print(f"#{p['id']} {short_name(p['name'] or p['query'], 6)}: {best}, {len(alerts)} alert(s)")
             except Exception as e:
                 print(f"#{p['id']} failed: {e}", file=sys.stderr)
+    export_history(conn)
 
 
 def main(argv=None):
@@ -623,7 +698,7 @@ def main(argv=None):
     elif a.cmd == "list":
         cmd_list(conn, a)
     elif a.cmd == "remove":
-        conn.execute("DELETE FROM products WHERE id=?", (a.id,)); conn.execute("DELETE FROM prices WHERE product_id=?", (a.id,))
+        conn.execute("DELETE FROM products WHERE id=?", (a.id,)); conn.execute("DELETE FROM prices WHERE product_id=?", (a.id,)); conn.execute("DELETE FROM checks WHERE product_id=?", (a.id,))
         conn.commit(); write_products(conn); print(f"removed #{a.id}")
     elif a.cmd == "every":
         conn.execute("UPDATE products SET every=? WHERE id=?", (a.interval, a.id)); conn.commit(); write_products(conn)

@@ -29,11 +29,12 @@ jobs:
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           COUNTRY: AU
+          TZ: Australia/Sydney
       - name: Save price history
         run: |
           git config user.name "price-tracker-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add prices.db alerts.log products.txt 2>/dev/null || true
+          for f in prices.db alerts.log products.txt history.csv; do [ -e "$f" ] && git add "$f"; done
           git diff --cached --quiet && exit 0
           git commit -m "Price check $(date -u +'%Y-%m-%d %H:%M') UTC"
           for i in 1 2 3; do git pull --rebase -X theirs && git push && exit 0; sleep 5; done
