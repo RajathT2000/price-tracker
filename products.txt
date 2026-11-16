@@ -1,0 +1,1 @@
+# One product per line: <link or name> | hour   (or | day)
