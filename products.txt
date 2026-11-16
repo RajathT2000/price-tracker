@@ -1,7 +1,7 @@
 # One product per line: <link or name> | hour   (or | day)
 # Every new deal for a keyword: watch: <keyword> | hour
-Apple iphone 18 pro | hour
-Apple airpods pro 3 | hour
-https://au.coach.com/products/tabby-chain-crossbody-bag-19-with-quilting/CBH23-B4AYS.html?utm_source=google&utm_medium=paid_ser&utm_campaign=Coach-RTL_Google_PLA_signal-RTL_Brand_AU_Non-Exact_RetailIcons_BAU_NA_Bags&gad_source=1&gad_campaignid=23520970061&gbraid=0AAAAADuAmk5N6rB1iN6cDueEfq5mMMj6s&gclid=Cj0KCQiA8OrXBhDEARIsAECtlx7jgUa7j_GY3HnNn6encJIgfTpwbphtvyUu1wLgHnMUCy7TeCRdg1AaAjSyEALw_wcB | hour
+Apple iphone 18 pro | day
+Apple airpods pro 3 | day
+https://au.coach.com/products/tabby-chain-crossbody-bag-19-with-quilting/CBH23-B4AYS.html?utm_source=google&utm_medium=paid_ser&utm_campaign=Coach-RTL_Google_PLA_signal-RTL_Brand_AU_Non-Exact_RetailIcons_BAU_NA_Bags&gad_source=1&gad_campaignid=23520970061&gbraid=0AAAAADuAmk5N6rB1iN6cDueEfq5mMMj6s&gclid=Cj0KCQiA8OrXBhDEARIsAECtlx7jgUa7j_GY3HnNn6encJIgfTpwbphtvyUu1wLgHnMUCy7TeCRdg1AaAjSyEALw_wcB | day
 Converse Chuck Taylor All Star Junior Low Top White | day
 Converse Chuck Taylor All Star Junior Low Top Black | day
