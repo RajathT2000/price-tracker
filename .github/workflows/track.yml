@@ -28,6 +28,7 @@ jobs:
       - run: python tracker.py check
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          COUNTRY: AU
       - name: Save price history
         run: |
           git config user.name "price-tracker-bot"

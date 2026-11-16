@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
@@ -25,6 +26,10 @@ PRODUCTS = HERE / "products.txt"  # one product per line: <link or name> | hour|
 INTERVALS = {"hour": 3600, "day": 86400}
 SLACK = 300  # run a few minutes early so an hourly scheduler never skips a slot
 MAX_OTHER_PAGES = 8
+COUNTRY_CURRENCY = {"AU": "AUD", "IN": "INR", "US": "USD", "GB": "GBP", "NZ": "NZD", "CA": "CAD"}
+DDG_REGION = {"AU": "au-en", "IN": "in-en", "US": "us-en", "GB": "uk-en", "NZ": "nz-en", "CA": "ca-en"}
+DEAL_FEEDS = {"AU": "https://www.ozbargain.com.au"}
+APPLE_WORDS = r"apple|iphone|ipad|airpods?|macbook|imac|mac ?mini|mac ?studio|homepod|airtag|apple ?watch|apple ?tv"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -48,6 +53,7 @@ def connect():
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
     conn.executescript("""
+    CREATE TABLE IF NOT EXISTS seen(watch TEXT, guid TEXT, PRIMARY KEY(watch, guid));
     CREATE TABLE IF NOT EXISTS products(
         id INTEGER PRIMARY KEY, query TEXT, url TEXT, name TEXT,
         every TEXT DEFAULT 'day', last_checked REAL DEFAULT 0,
@@ -59,6 +65,10 @@ def connect():
     return conn
 
 
+def country():
+    return (os.environ.get("COUNTRY") or load_config().get("country") or "").upper() or None
+
+
 def load_config():
     try:
         return json.loads(CONFIG.read_text())
@@ -67,10 +77,13 @@ def load_config():
 
 
 # ---------- fetching / parsing ----------
-def fetch(url, data=None):
+FEED_HEADERS = {"User-Agent": "price-tracker/1.0 (personal RSS reader)"}
+
+
+def fetch(url, data=None, headers=None):
     try:
-        r = (requests.post(url, data=data, headers=HEADERS, timeout=25) if data
-             else requests.get(url, headers=HEADERS, timeout=25))
+        r = (requests.post(url, data=data, headers=headers or HEADERS, timeout=25) if data
+             else requests.get(url, headers=headers or HEADERS, timeout=25))
     except requests.RequestException:
         return None
     if r.status_code != 200 or blocked(r.text):
@@ -227,7 +240,11 @@ def extract(html):
 # ---------- searching other stores ----------
 def search(query, n=10):
     urls = []
-    html = fetch("https://html.duckduckgo.com/html/", data={"q": query})
+    c = country()
+    ddg = {"q": query}
+    if c in DDG_REGION:
+        ddg["kl"] = DDG_REGION[c]
+    html = fetch("https://html.duckduckgo.com/html/", data=ddg)
     if html:
         for a in BeautifulSoup(html, "html.parser").select("a.result__a"):
             href = a.get("href", "")
@@ -236,7 +253,8 @@ def search(query, n=10):
             if href.startswith("http") and "duckduckgo.com" not in href:
                 urls.append(href)
     if not urls:
-        html = fetch("https://www.bing.com/search?q=" + urllib.parse.quote(query))
+        region = f"&cc={c}&mkt=en-{c}&setlang=en-{c}" if c else ""
+        html = fetch("https://www.bing.com/search?q=" + urllib.parse.quote(query) + region)
         if html:
             for a in BeautifulSoup(html, "html.parser").select("li.b_algo h2 a"):
                 href = bing_target(a.get("href", ""))
@@ -363,7 +381,8 @@ def check(conn, p):
         if (not info.get("price") or is_listing(u, info.get("name"))
                 or not same_product(short_name(name, 12), info.get("name"))):
             continue
-        if orig and orig["currency"] and info.get("currency") and info["currency"] != orig["currency"]:
+        want = (orig and orig["currency"]) or COUNTRY_CURRENCY.get(country())
+        if want and info.get("currency") and info["currency"] != want:
             continue
         results.append({"store": domain(u), "url": u, "price": info["price"], "currency": info.get("currency"),
                         "offer": info.get("offer"), "source": "other"})
@@ -426,7 +445,7 @@ def sync(conn):
     have = {r["query"]: r for r in conn.execute("SELECT * FROM products")}
     for q, every in wanted.items():
         if q not in have:
-            url = q if re.match(r"https?://", q) else None
+            url = q if re.match(r"https?://", q) and not is_watch(q) else None
             conn.execute("INSERT INTO products(query,url,every,added) VALUES(?,?,?,?)",
                          (q, url, every, datetime.now().isoformat(timespec="seconds")))
         elif have[q]["every"] != every:
@@ -444,6 +463,82 @@ def write_products(conn):
     PRODUCTS.write_text(head + "".join(f"{r['query']} | {r['every']}\n" for r in rows))
 
 
+def is_watch(query):
+    return bool(re.match(r"\s*watch\s*:", query or "", re.I))
+
+
+def watch_pattern(keyword):
+    k = keyword.strip().lower()
+    body = APPLE_WORDS if k == "apple" else re.escape(k).replace(r"\ ", r"\s*")
+    return re.compile(r"\b(?:" + body + r")\b", re.I)
+
+
+def parse_feed(xml_text):
+    """OzBargain-style RSS -> [{guid, title, link, store_url, expired}]."""
+    ns = {"ozb": "https://www.ozbargain.com.au"}
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+    items = []
+    for it in root.iter("item"):
+        meta = it.find("ozb:meta", ns)
+        msg = it.find("ozb:title-msg", ns)
+        items.append({
+            "guid": (it.findtext("guid") or it.findtext("link") or "").strip(),
+            "title": (it.findtext("title") or "").strip(),
+            "link": (it.findtext("link") or "").strip(),
+            "store_url": meta.get("url") if meta is not None else None,
+            "expired": msg is not None and msg.get("type") in ("expired", "out of stock"),
+            "cats": " ".join(c.text or "" for c in it.findall("category")),
+        })
+    return items
+
+
+def deal_store(title, url):
+    m = re.search(r"@\s*([^@]+?)\s*$", title)
+    return m.group(1) if m else domain(url)
+
+
+def check_watch(conn, p):
+    """Alert on every new deal matching the keyword (e.g. 'watch: apple')."""
+    keyword = p["query"].split(":", 1)[1].strip()
+    base = DEAL_FEEDS.get(country() or "AU", DEAL_FEEDS["AU"])
+    slug = re.sub(r"[^a-z0-9]+", "-", keyword.lower()).strip("-")
+    pat = watch_pattern(keyword)
+    items, seen_guids = [], set()
+    for feed in (f"{base}/brand/{slug}/feed", f"{base}/deals/feed"):
+        for it in parse_feed(fetch(feed, headers=FEED_HEADERS) or ""):
+            if it["guid"] and it["guid"] not in seen_guids and pat.search(it["title"] + " " + it["cats"]):
+                seen_guids.add(it["guid"])
+                items.append(it)
+    first = conn.execute("SELECT COUNT(*) FROM seen WHERE watch=?", (p["query"],)).fetchone()[0] == 0
+    new = [it for it in items if not it["expired"] and not conn.execute(
+        "SELECT 1 FROM seen WHERE watch=? AND guid=?", (p["query"], it["guid"])).fetchone()]
+    now = datetime.now().isoformat(timespec="seconds")
+    alerts = []
+    for i, it in enumerate(new):
+        link = it["store_url"] or it["link"]
+        price, _ = parse_price((re.search(r"(?:A?\$|AU\$)\s?[\d,]+(?:\.\d+)?", it["title"]) or [None])[0])
+        store = deal_store(it["title"], link)
+        conn.execute("INSERT INTO prices(product_id,ts,store,url,price,currency,offer,source) VALUES(?,?,?,?,?,?,?,?)",
+                     (p["id"], now, store, link, price, COUNTRY_CURRENCY.get(country() or "AU"), it["title"], "deal"))
+        if not first or i < 3:  # first run: show the 3 newest, quietly remember the rest
+            alerts.append((it["title"], link))
+    for it in items:
+        conn.execute("INSERT OR IGNORE INTO seen(watch,guid) VALUES(?,?)", (p["query"], it["guid"]))
+    for msg, link in alerts:
+        notify(f"{keyword.title()} deal", msg, link)
+    conn.execute("UPDATE products SET name=?, last_checked=? WHERE id=?",
+                 (f"Watch: {keyword}", time.time(), p["id"]))
+    conn.commit()
+    results = [{"store": deal_store(it["title"], it["store_url"] or it["link"]), "url": it["store_url"] or it["link"],
+                "price": parse_price((re.search(r"\$\s?[\d,]+(?:\.\d+)?", it["title"]) or [None])[0])[0] or 0,
+                "currency": COUNTRY_CURRENCY.get(country() or "AU"), "offer": it["title"], "source": "deal"}
+               for it in new]
+    return results, alerts
+
+
 def due(p, now=None):
     return (now or time.time()) - (p["last_checked"] or 0) >= INTERVALS[p["every"]] - SLACK
 
@@ -452,7 +547,7 @@ def due(p, now=None):
 def cmd_add(conn, a):
     target = a.target.strip()
     url = target if re.match(r"https?://", target) else None
-    if not url:
+    if not url and not is_watch(target):
         for u in search(target + " price"):
             if is_listing(u):
                 continue
@@ -461,12 +556,14 @@ def cmd_add(conn, a):
             if info.get("price") and same_product(target, info.get("name")):
                 url = u
                 break
+    if is_watch(target):
+        url = None
     cur = conn.execute("INSERT INTO products(query,url,every,added) VALUES(?,?,?,?)",
                        (target, url, a.every, datetime.now().isoformat(timespec="seconds")))
     conn.commit()
     write_products(conn)
     p = conn.execute("SELECT * FROM products WHERE id=?", (cur.lastrowid,)).fetchone()
-    results, _ = check(conn, p)
+    results, _ = (check_watch if is_watch(target) else check)(conn, p)
     p = conn.execute("SELECT * FROM products WHERE id=?", (cur.lastrowid,)).fetchone()
     print(f"Added #{p['id']}: {p['name']} (every {p['every']})")
     print(f"  page: {p['url'] or 'none found, tracking by name'}")
@@ -501,7 +598,7 @@ def cmd_check(conn, a):
     for p in conn.execute("SELECT * FROM products").fetchall():
         if a.all or due(p):
             try:
-                results, alerts = check(conn, p)
+                results, alerts = (check_watch if is_watch(p["query"]) else check)(conn, p)
                 low = min(results, key=lambda r: r["price"]) if results else None
                 best = "%s %.2f at %s" % (low["currency"] or "", low["price"], low["store"]) if low else "no price"
                 print(f"#{p['id']} {short_name(p['name'] or p['query'], 6)}: {best}, {len(alerts)} alert(s)")

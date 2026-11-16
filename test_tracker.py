@@ -5,6 +5,8 @@ import pytest
 
 import tracker as t
 
+REAL_SEARCH = t.search
+
 ORIG = "https://www.shop-a.com/p/sony-wh-1000xm5"
 OTHER = "https://store-b.com/sony-wh1000xm5-headphones"
 WRONG = "https://store-c.com/sony-wh-1000xm4"
@@ -29,7 +31,7 @@ def env(tmp_path, monkeypatch):
     cfg.write_text('{"desktop": false}')
     monkeypatch.setattr(t, "CONFIG", cfg)
     pages = {}
-    monkeypatch.setattr(t, "fetch", lambda url, data=None: pages.get(url))
+    monkeypatch.setattr(t, "fetch", lambda url, data=None, headers=None: pages.get(url))
     monkeypatch.setattr(t, "search", lambda q, n=10: [ORIG, OTHER, WRONG])
     return pages
 
@@ -273,3 +275,84 @@ def test_workflow_runs_hourly_and_saves_history():
     wf = (t.HERE / ".github/workflows/track.yml").read_text()
     assert 'cron: "17 * * * *"' in wf and "python tracker.py check" in wf
     assert "secrets.NTFY_TOPIC" in wf and "git push" in wf and "prices.db" in wf
+
+
+# --- watch mode (every deal for a keyword) + country ---
+def rss(*items):
+    body = ""
+    for guid, title, url, expired in items:
+        body += (f'<item><title>{title}</title><link>https://www.ozbargain.com.au/node/{guid}</link>'
+                 f'<category>Apple</category><ozb:meta url="{url}" />'
+                 + ('<ozb:title-msg type="expired">expired</ozb:title-msg>' if expired else "")
+                 + f'<guid isPermaLink="false">{guid} at ozb</guid></item>')
+    return ('<?xml version="1.0"?><rss xmlns:ozb="https://www.ozbargain.com.au"><channel>'
+            + body + '</channel></rss>')
+
+
+FEED_APPLE = "https://www.ozbargain.com.au/brand/apple/feed"
+FEED_ALL = "https://www.ozbargain.com.au/deals/feed"
+
+
+def test_watch_pattern_covers_apple_products_only():
+    p = t.watch_pattern("apple")
+    for title in ["AirPods Max $599 @ JB Hi-Fi", "iPhone 18 Pro $1,899", "MacBook Air M5", "iPad Air 11",
+                  "Apple Watch Series 11", "Mac mini M4", "AirTag 4 pack"]:
+        assert p.search(title), title
+    assert not p.search("Pineapple chunks 440g @ Coles") and not p.search("Samsung Galaxy S26")
+    assert t.watch_pattern("air max").search("Nike Air Max 90 $99")
+
+
+def test_parse_feed():
+    items = t.parse_feed(rss(("1", "AirPods Max $599 @ JB Hi-Fi", "https://jbhifi.com.au/p/1", False),
+                             ("2", "iPad $399 @ Big W", "https://bigw.com.au/p/2", True)))
+    assert items[0]["title"] == "AirPods Max $599 @ JB Hi-Fi" and items[0]["store_url"] == "https://jbhifi.com.au/p/1"
+    assert not items[0]["expired"] and items[1]["expired"]
+    assert t.parse_feed("not xml") == []
+
+
+def test_watch_alerts_every_new_apple_deal(env):
+    env[FEED_APPLE] = rss(*[(str(i), f"Apple iPad {i} ${300 + i} @ Store{i}", f"https://s{i}.com.au/p", False)
+                            for i in range(5)])
+    env[FEED_ALL] = rss(("90", "Pineapple 1kg $3 @ Coles", "https://coles.com.au/p", False))
+    t.PRODUCTS.write_text("watch: apple | hour\n")
+    conn = t.connect()
+    t.sync(conn)
+    p = conn.execute("SELECT * FROM products").fetchone()
+    assert p["url"] is None
+    _, alerts = t.check_watch(conn, p)
+    assert len(alerts) == 3  # first run: 3 newest, not a flood
+    _, alerts = t.check_watch(conn, reload(conn, p["id"]))
+    assert alerts == []  # nothing new, nothing repeated
+    env[FEED_APPLE] = rss(("7", "AirPods Max $549 @ JB Hi-Fi", "https://www.jbhifi.com.au/products/airpods-max", False),
+                          ("8", "iPhone 18 $999 @ Amazon AU", "https://amazon.com.au/x", True))  # expired: skip
+    _, alerts = t.check_watch(conn, reload(conn, p["id"]))
+    assert alerts == [("AirPods Max $549 @ JB Hi-Fi", "https://www.jbhifi.com.au/products/airpods-max")]
+    row = conn.execute("SELECT store, price, currency FROM prices WHERE source='deal' ORDER BY id DESC").fetchone()
+    assert tuple(row) == ("JB Hi-Fi", 549.0, "AUD")
+    assert "Apple deal: AirPods Max $549 @ JB Hi-Fi" in t.LOG.read_text()
+
+
+def test_check_command_runs_watch_lines(env, capsys):
+    env[FEED_APPLE] = rss(("1", "AirPods Pro 3 $289 @ Costco", "https://costco.com.au/p", False))
+    t.PRODUCTS.write_text("watch: apple | hour\n")
+    t.main(["check"])
+    assert "1 alert(s)" in capsys.readouterr().out
+
+
+def test_country_sets_search_region_and_currency(env, monkeypatch):
+    monkeypatch.setenv("COUNTRY", "AU")
+    calls = []
+    monkeypatch.setattr(t, "fetch", lambda url, data=None, headers=None: calls.append((url, data)))
+    REAL_SEARCH("airpods max price")
+    assert calls[0][1]["kl"] == "au-en" and "cc=AU" in calls[1][0]
+
+
+def test_name_only_product_ignores_other_country_prices(env, monkeypatch):
+    monkeypatch.setenv("COUNTRY", "AU")
+    env[OTHER] = ld_page("Sony WH-1000XM5", 300, "USD")
+    env[WRONG.replace("xm4", "xm5")] = ld_page("Sony WH-1000XM5", 420, "AUD")
+    monkeypatch.setattr(t, "search", lambda q, n=10: [OTHER, WRONG.replace("xm4", "xm5")])
+    conn = t.connect()
+    conn.execute("INSERT INTO products(query,every) VALUES('Sony WH-1000XM5','day')"); conn.commit()
+    results, _ = t.check(conn, conn.execute("SELECT * FROM products").fetchone())
+    assert [(r["price"], r["currency"]) for r in results] == [(420, "AUD")]

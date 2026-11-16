@@ -1,1 +1,3 @@
 # One product per line: <link or name> | hour   (or | day)
+# Every new deal for a keyword: watch: <keyword> | hour
+watch: apple | hour
