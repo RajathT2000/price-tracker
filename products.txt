@@ -1,7 +1,6 @@
 # One product per line: <link or name> | hour   (or | day)
 # Every new deal for a keyword: watch: <keyword> | hour
 Apple iphone 18 pro | day
-Apple airpods pro 3 | day
 https://au.coach.com/products/tabby-chain-crossbody-bag-19-with-quilting/CBH23-B4AYS.html | day
 Converse Chuck Taylor All Star Junior Low Top White | day
 Converse Chuck Taylor All Star Junior Low Top Black | day
