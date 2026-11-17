@@ -30,6 +30,12 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           COUNTRY: AU
           TZ: Australia/Sydney
+      # Self-gated: morning (sale hour or 00:00 Sydney) + evening (18:00 Sydney) — two updates/day
+      - run: python tracker.py daily-report
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          COUNTRY: AU
+          TZ: Australia/Sydney
       - name: Save price history
         run: |
           git config user.name "price-tracker-bot"

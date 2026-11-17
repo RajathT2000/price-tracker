@@ -12,8 +12,10 @@ import sys
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from collections import Counter
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
@@ -28,9 +30,17 @@ PRODUCTS = HERE / "products.txt"  # one product per line: <link or name> | hour|
 INTERVALS = {"hour": 3600, "day": 86400}
 SLACK = 300  # run a few minutes early so an hourly scheduler never skips a slot
 MAX_OTHER_PAGES = 8
+TZ = ZoneInfo("Australia/Sydney")
 COUNTRY_CURRENCY = {"AU": "AUD", "IN": "INR", "US": "USD", "GB": "GBP", "NZ": "NZD", "CA": "CAD"}
 DDG_REGION = {"AU": "au-en", "IN": "in-en", "US": "us-en", "GB": "uk-en", "NZ": "nz-en", "CA": "ca-en"}
 DEAL_FEEDS = {"AU": "https://www.ozbargain.com.au"}
+# OzBargain + similar AU deal RSS endpoints (search path filled per product)
+DEAL_SEARCH_TEMPLATES = {
+    "AU": [
+        "https://www.ozbargain.com.au/search/node/{q}/feed",
+        "https://www.ozbargain.com.au/search/node/{q}%20type%3Aozbdeal/feed",
+    ],
+}
 APPLE_WORDS = r"apple|iphone|ipad|airpods?|macbook|imac|mac ?mini|mac ?studio|homepod|airtag|apple ?watch|apple ?tv"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -66,6 +76,7 @@ def connect():
     CREATE TABLE IF NOT EXISTS prices(
         id INTEGER PRIMARY KEY, product_id INTEGER, ts TEXT, store TEXT, url TEXT,
         price REAL, currency TEXT, offer TEXT, source TEXT);
+    CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
     """)
     return conn
 
@@ -79,6 +90,170 @@ def load_config():
         return json.loads(CONFIG.read_text())
     except (OSError, ValueError):
         return {}
+
+
+def now_sydney():
+    return datetime.now(TZ)
+
+
+def now_sydney_iso():
+    """Sydney wall-clock timestamp stored on every price check."""
+    return now_sydney().strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def meta_get(conn, key, default=None):
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def meta_set(conn, key, value):
+    conn.execute("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                 (key, value))
+
+
+def parse_ts(ts):
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ)
+    return dt.astimezone(TZ)
+
+
+def save_price(conn, product_id, store, price, ts=None, url=None, currency=None, offer=None, source=None):
+    """Persist one price observation (product, store, price, date/time)."""
+    if price is None:
+        return
+    conn.execute(
+        "INSERT INTO prices(product_id,ts,store,url,price,currency,offer,source) VALUES(?,?,?,?,?,?,?,?)",
+        (product_id, ts or now_sydney_iso(), store, url, price, currency, offer, source))
+
+
+def day_price(conn, product_id, day):
+    """Best (lowest) price for product on a Sydney calendar day, or None."""
+    start, end = f"{day.isoformat()}T00:00:00", f"{day.isoformat()}T23:59:59"
+    row = conn.execute(
+        "SELECT MIN(price) AS p FROM prices WHERE product_id=? AND price IS NOT NULL AND ts>=? AND ts<=?",
+        (product_id, start, end)).fetchone()
+    return row["p"] if row and row["p"] is not None else None
+
+
+def week_avg_price(conn, product_id, today):
+    start = (today - timedelta(days=6)).isoformat() + "T00:00:00"
+    end = today.isoformat() + "T23:59:59"
+    row = conn.execute(
+        "SELECT AVG(price) AS a FROM prices WHERE product_id=? AND price IS NOT NULL AND ts>=? AND ts<=?",
+        (product_id, start, end)).fetchone()
+    return row["a"] if row and row["a"] is not None else None
+
+
+def lowest_price(conn, product_id):
+    row = conn.execute(
+        "SELECT MIN(price) AS p FROM prices WHERE product_id=? AND price IS NOT NULL",
+        (product_id,)).fetchone()
+    return row["p"] if row and row["p"] is not None else None
+
+
+def today_best_row(conn, product_id, today=None):
+    """Cheapest observation today for a product: store, url, price, currency."""
+    today = today or now_sydney().date()
+    start, end = f"{today.isoformat()}T00:00:00", f"{today.isoformat()}T23:59:59"
+    return conn.execute(
+        "SELECT store, url, price, currency FROM prices "
+        "WHERE product_id=? AND price IS NOT NULL AND ts>=? AND ts<=? "
+        "ORDER BY price ASC, id DESC LIMIT 1",
+        (product_id, start, end)).fetchone()
+
+
+def product_report_stats(conn, product_id, today=None):
+    """Today / yesterday / week average / all-time lowest from the database."""
+    today = today or now_sydney().date()
+    yesterday = today - timedelta(days=1)
+    best = today_best_row(conn, product_id, today)
+    return {
+        "today": day_price(conn, product_id, today),
+        "yesterday": day_price(conn, product_id, yesterday),
+        "week_avg": week_avg_price(conn, product_id, today),
+        "lowest": lowest_price(conn, product_id),
+        "store": best["store"] if best else None,
+        "url": best["url"] if best else None,
+    }
+
+
+def fmt_money(val, currency=""):
+    if val is None:
+        return "NA"
+    cur = f"{currency} " if currency else ""
+    return f"{cur}{val:,.2f}".strip()
+
+
+def typical_store_sale_hours(conn):
+    """
+    Infer usual sale-go-live hour (Australia/Sydney) per store from historical drops.
+    Returns {store: hour_int} when a store has a clear peak hour.
+    """
+    rows = conn.execute(
+        "SELECT store, ts, price FROM prices WHERE price IS NOT NULL AND store IS NOT NULL "
+        "ORDER BY store, ts, id").fetchall()
+    drop_hours = {}  # store -> [hour, ...]
+    prev = {}
+    for r in rows:
+        store, price = r["store"], r["price"]
+        dt = parse_ts(r["ts"])
+        if not dt or price is None:
+            continue
+        if store in prev and price < prev[store] * 0.98:  # real drop (~2%+)
+            drop_hours.setdefault(store, []).append(dt.hour)
+        prev[store] = price
+    out = {}
+    for store, hours in drop_hours.items():
+        if len(hours) < 3:
+            continue
+        hour, count = Counter(hours).most_common(1)[0]
+        if count / len(hours) >= 0.35:
+            out[store] = hour
+    return out
+
+
+EVENING_REPORT_HOUR = 18  # 6pm Australia/Sydney — second daily update
+
+
+def morning_report_hour(conn):
+    """Prefer common store sale hour; otherwise midnight (0) Sydney."""
+    hours = list(typical_store_sale_hours(conn).values())
+    if not hours:
+        return 0
+    hour, count = Counter(hours).most_common(1)[0]
+    if count >= 1 and count / len(hours) >= 0.5:
+        return hour
+    return 0
+
+
+def evening_report_hour(_conn=None):
+    return EVENING_REPORT_HOUR
+
+
+def report_meta_key(slot):
+    return f"last_{slot}_report"  # morning | evening
+
+
+def report_due(conn, slot, now=None, force=False):
+    """True once per Sydney day for that slot (morning or evening)."""
+    if force:
+        return True
+    now = now or now_sydney()
+    today = now.strftime("%Y-%m-%d")
+    if meta_get(conn, report_meta_key(slot)) == today:
+        return False
+    want = morning_report_hour(conn) if slot == "morning" else evening_report_hour(conn)
+    return now.hour == want
+
+
+def morning_report_due(conn, now=None, force=False):
+    return report_due(conn, "morning", now=now, force=force)
 
 
 # ---------- fetching / parsing ----------
@@ -343,12 +518,16 @@ def short_name(name, words=8):
 
 
 # ---------- notifications ----------
-def notify(title, message, link=None):
-    line = f"{datetime.now():%Y-%m-%d %H:%M}  {title}: {message}" + (f"  {link}" if link else "")
+def notify(title, message, link=None, *, tags="moneybag", priority=None, lowest=False):
+    line = f"{now_sydney():%Y-%m-%d %H:%M}  {title}: {message}" + (f"  {link}" if link else "")
     print(line)
     with open(LOG, "a") as f:
         f.write(line + "\n")
     cfg = load_config()
+    if lowest:
+        tags = "rotating_light,arrow_down,moneybag"
+        priority = priority or "high"
+        title = f"LOWEST PRICE · {title}"
     if sys.platform == "darwin" and cfg.get("desktop", True):
         esc = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')
         subprocess.run(["osascript", "-e", f'display notification "{esc(message)}" with title "{esc(title)}"'],
@@ -356,7 +535,9 @@ def notify(title, message, link=None):
     topic = os.environ.get("NTFY_TOPIC") or cfg.get("ntfy_topic")
     if topic:
         try:
-            headers = {"Title": title.encode("utf-8"), "Tags": "moneybag"}
+            headers = {"Title": title.encode("utf-8"), "Tags": tags}
+            if priority:
+                headers["Priority"] = str(priority)
             if link:
                 headers["Click"] = link
             requests.post(f"https://ntfy.sh/{topic}", data=(message + (f"\n{link}" if link else "")).encode(),
@@ -367,7 +548,7 @@ def notify(title, message, link=None):
 
 # ---------- core ----------
 def check(conn, p):
-    now = datetime.now().isoformat(timespec="seconds")
+    now = now_sydney_iso()
     results, orig = [], None
     name = p["name"] or (url_name(p["url"]) if p["url"] and p["query"] == p["url"] else p["query"])
     log = []  # every site looked at in this check, saved to the checks table
@@ -428,15 +609,15 @@ def check(conn, p):
 
     prev_low = conn.execute("SELECT MIN(price) FROM prices WHERE product_id=?", (p["id"],)).fetchone()[0]
     for r in results:
-        conn.execute("INSERT INTO prices(product_id,ts,store,url,price,currency,offer,source) VALUES(?,?,?,?,?,?,?,?)",
-                     (p["id"], now, r["store"], r["url"], r["price"], r["currency"], r["offer"], r["source"]))
+        save_price(conn, p["id"], r["store"], r["price"], ts=now, url=r["url"],
+                   currency=r["currency"], offer=r["offer"], source=r["source"])
 
     alerts = []
     fmt = lambda r: f"{r['currency'] or ''} {r['price']:,.2f}".strip()
     if orig and p["last_price"] and orig["price"] < p["last_price"]:
-        alerts.append((f"Price drop: {fmt(orig)} at {orig['store']} (was {p['last_price']:,.2f})", orig["url"]))
+        alerts.append((f"Price drop: {fmt(orig)} at {orig['store']} (was {p['last_price']:,.2f})", orig["url"], False))
     if orig and orig["offer"] and orig["offer"] != p["last_offer"]:
-        alerts.append((f"Offer at {orig['store']}: {orig['offer']} — now {fmt(orig)}", orig["url"]))
+        alerts.append((f"Offer at {orig['store']}: {orig['offer']} — now {fmt(orig)}", orig["url"], False))
     others = sorted((r for r in results if r["source"] == "other"), key=lambda r: r["price"])
     key = p["last_alert"]
     if others and (not orig or others[0]["price"] < orig["price"]):
@@ -445,20 +626,22 @@ def check(conn, p):
         if k != p["last_alert"] and (prev_low is None or best["price"] < prev_low or
                                      (orig and best["price"] < orig["price"])):
             ref = f" (original {fmt(orig)})" if orig else ""
-            alerts.append((f"Cheaper: {fmt(best)} at {best['store']}{ref}", best["url"]))
+            is_low = prev_low is None or best["price"] <= prev_low
+            alerts.append((f"Cheaper: {fmt(best)} at {best['store']}{ref}", best["url"], is_low))
             key = k
     if prev_low is not None and results:
         low = min(results, key=lambda r: r["price"])
-        if low["price"] < prev_low and not any(low["url"] == u for _, u in alerts):
-            alerts.append((f"New lowest: {fmt(low)} at {low['store']} (previous low {prev_low:,.2f})", low["url"]))
+        if low["price"] < prev_low and not any(low["url"] == u for _, u, *_ in alerts):
+            alerts.append((f"New lowest: {fmt(low)} at {low['store']} (previous low {prev_low:,.2f})",
+                           low["url"], True))
 
-    for msg, link in alerts:
-        notify(short_name(name, 6) or "Price alert", msg, link)
+    for msg, link, is_lowest in alerts:
+        notify(short_name(name, 6) or "Price alert", msg, link, lowest=is_lowest)
     conn.execute("UPDATE products SET name=?, last_checked=?, last_price=?, last_offer=?, last_alert=? WHERE id=?",
                  (name, time.time(), orig["price"] if orig else p["last_price"],
                   orig["offer"] if orig else p["last_offer"], key, p["id"]))
     conn.commit()
-    return results, alerts
+    return results, [(m, u) for m, u, _ in alerts]
 
 
 def parse_products(text):
@@ -577,7 +760,7 @@ def check_watch(conn, p):
     first = conn.execute("SELECT COUNT(*) FROM seen WHERE watch=?", (p["query"],)).fetchone()[0] == 0
     new = [it for it in items if not it["expired"] and not conn.execute(
         "SELECT 1 FROM seen WHERE watch=? AND guid=?", (p["query"], it["guid"])).fetchone()]
-    now = datetime.now().isoformat(timespec="seconds")
+    now = now_sydney_iso()
     new_guids = {it["guid"] for it in new}
     log = []
     for it in items:
@@ -594,14 +777,14 @@ def check_watch(conn, p):
         link = it["store_url"] or it["link"]
         price, _ = parse_price((re.search(r"(?:A?\$|AU\$)\s?[\d,]+(?:\.\d+)?", it["title"]) or [None])[0])
         store = deal_store(it["title"], link)
-        conn.execute("INSERT INTO prices(product_id,ts,store,url,price,currency,offer,source) VALUES(?,?,?,?,?,?,?,?)",
-                     (p["id"], now, store, link, price, COUNTRY_CURRENCY.get(country() or "AU"), it["title"], "deal"))
+        save_price(conn, p["id"], store, price, ts=now, url=link,
+                   currency=COUNTRY_CURRENCY.get(country() or "AU"), offer=it["title"], source="deal")
         if not first or i < 3:  # first run: show the 3 newest, quietly remember the rest
             alerts.append((it["title"], link))
     for it in items:
         conn.execute("INSERT OR IGNORE INTO seen(watch,guid) VALUES(?,?)", (p["query"], it["guid"]))
     for msg, link in alerts:
-        notify(f"{keyword.title()} deal", msg, link)
+        notify(f"{keyword.title()} deal", msg, link, tags="shopping_bags,moneybag")
     conn.execute("UPDATE products SET name=?, last_checked=? WHERE id=?",
                  (f"Watch: {keyword}", time.time(), p["id"]))
     conn.commit()
@@ -614,6 +797,221 @@ def check_watch(conn, p):
 
 def due(p, now=None):
     return (now or time.time()) - (p["last_checked"] or 0) >= INTERVALS[p["every"]] - SLACK
+
+
+def product_deal_query(p):
+    if is_watch(p["query"] or ""):
+        return p["query"].split(":", 1)[1].strip()
+    if re.match(r"https?://", p["query"] or ""):
+        return short_name(p["name"] or url_name(p["query"]), 6)
+    return short_name(p["name"] or p["query"], 6)
+
+
+def search_deal_feeds_for_product(conn, p):
+    """OzBargain (+ similar) RSS offers matching a tracked product. Returns new deals only."""
+    q = product_deal_query(p)
+    if not q:
+        return []
+    c = country() or "AU"
+    base = DEAL_FEEDS.get(c, DEAL_FEEDS["AU"])
+    templates = DEAL_SEARCH_TEMPLATES.get(c, DEAL_SEARCH_TEMPLATES["AU"])
+    quoted = urllib.parse.quote(q)
+    feeds = [t.format(q=quoted) for t in templates] + [f"{base}/deals/feed"]
+    slug = re.sub(r"[^a-z0-9]+", "-", q.lower()).strip("-")
+    if slug:
+        feeds.insert(0, f"{base}/brand/{slug}/feed")
+    pat = watch_pattern(q) if len(tokens(q)) <= 2 else None
+    key_toks = tokens(q) - GENERIC
+    watch_key = f"deal:{p['id']}"
+    items, seen_guids = [], set()
+    for feed in feeds:
+        for it in parse_feed(fetch(feed, headers=FEED_HEADERS) or ""):
+            if not it["guid"] or it["guid"] in seen_guids or it.get("expired"):
+                continue
+            blob = f"{it['title']} {it.get('cats') or ''}"
+            if pat:
+                if not pat.search(blob):
+                    continue
+            elif key_toks:
+                hit = key_toks & tokens(blob)
+                if len(hit) < min(2, len(key_toks)):
+                    continue
+            seen_guids.add(it["guid"])
+            items.append(it)
+    new = []
+    for it in items:
+        if conn.execute("SELECT 1 FROM seen WHERE watch=? AND guid=?", (watch_key, it["guid"])).fetchone():
+            continue
+        conn.execute("INSERT OR IGNORE INTO seen(watch,guid) VALUES(?,?)", (watch_key, it["guid"]))
+        link = it["store_url"] or it["link"]
+        price, _ = parse_price((re.search(r"(?:A?\$|AU\$|\$)\s?[\d,]+(?:\.\d+)?", it["title"]) or [None])[0])
+        new.append({"title": it["title"], "price": price, "link": link,
+                    "currency": COUNTRY_CURRENCY.get(c)})
+    return new
+
+
+def _short_price(val, currency=""):
+    """Compact money for phone digests: $1,299 or NA."""
+    if val is None:
+        return "NA"
+    sym = "$" if (currency or "").upper() in ("", "AUD", "USD", "CAD", "NZD") else f"{currency} "
+    if float(val).is_integer():
+        return f"{sym}{int(val):,}"
+    return f"{sym}{val:,.2f}"
+
+
+def build_daily_report(conn, slot="morning", today=None):
+    """
+    Short phone-friendly digest with buy link per product.
+    Returns (body, lowest_ids, click_url, product_links).
+    click_url = best overall deal to open when the digest is tapped.
+    product_links = [(name, price_str, store, url, is_lowest), ...] for per-item alerts.
+    """
+    today = today or now_sydney().date()
+    cur_default = COUNTRY_CURRENCY.get(country() or "AU", "")
+    lines, lowest_ids, product_links = [], [], []
+    click_url, click_price = None, None
+    if slot == "evening":
+        lines.append(f"🌙 Evening check · {today.isoformat()}")
+    else:
+        lines.append(f"☀️ Morning check · {today.isoformat()}")
+    count = 0
+    for p in conn.execute("SELECT * FROM products ORDER BY id").fetchall():
+        if is_watch(p["query"] or ""):
+            continue
+        stats = product_report_stats(conn, p["id"], today)
+        cur = cur_default
+        row = conn.execute(
+            "SELECT currency FROM prices WHERE product_id=? AND currency IS NOT NULL ORDER BY id DESC LIMIT 1",
+            (p["id"],)).fetchone()
+        if row:
+            cur = row["currency"] or cur
+        name = short_name(p["name"] or p["query"], 5)
+        today_s = _short_price(stats["today"], cur)
+        is_lowest = (stats["today"] is not None and stats["lowest"] is not None
+                     and abs(stats["today"] - stats["lowest"]) < 0.005)
+        bits = []
+        if is_lowest:
+            bits.append("↓ lowest today")
+            lowest_ids.append(p["id"])
+        elif stats["yesterday"] is not None and stats["today"] is not None:
+            if stats["today"] < stats["yesterday"]:
+                bits.append(f"was {_short_price(stats['yesterday'], cur)}")
+            elif stats["today"] > stats["yesterday"]:
+                bits.append(f"up from {_short_price(stats['yesterday'], cur)}")
+            else:
+                bits.append("same as yesterday")
+        else:
+            bits.append("yesterday NA")
+        if stats["week_avg"] is not None and not is_lowest:
+            bits.append(f"wk {_short_price(stats['week_avg'], cur)}")
+        detail = " · ".join(bits)
+        store = stats.get("store") or ""
+        url = stats.get("url") or ""
+        block = f"\n{name}\n{today_s}  {detail}"
+        if store or url:
+            where = store or domain(url)
+            block += f"\n{where}"
+            if url:
+                block += f"\n{url}"
+        lines.append(block)
+        if stats["today"] is not None and url:
+            product_links.append((name, today_s, store or domain(url), url, is_lowest))
+            if click_price is None or stats["today"] < click_price:
+                click_price, click_url = stats["today"], url
+            elif is_lowest and (click_price is None or stats["today"] <= click_price):
+                click_url = url
+        count += 1
+    if count == 0:
+        lines.append("\n(no products yet)")
+    lines.append("\n————————\nTap item alerts to open the store")
+    return "\n".join(lines), lowest_ids, click_url, product_links
+
+
+def build_morning_report(conn, today=None):
+    body, lowest_ids, *_ = build_daily_report(conn, "morning", today=today)
+    return body, lowest_ids
+
+
+def send_slot_report(conn, slot, *, refresh=True, search_deals=True, demo=False):
+    """Refresh prices, notify the morning/evening digest (+ per-product buy links + deals)."""
+    if refresh:
+        for p in conn.execute("SELECT * FROM products").fetchall():
+            try:
+                (check_watch if is_watch(p["query"]) else check)(conn, p)
+            except Exception as e:
+                print(f"#{p['id']} failed: {e}", file=sys.stderr)
+        export_history(conn)
+
+    body, lowest_ids, click_url, product_links = build_daily_report(conn, slot)
+    if demo:
+        body = "DEMO — sample of your twice-daily report\n\n" + body
+    label = "Evening" if slot == "evening" else "Morning"
+    title = f"Price digest · {label.lower()}" + (" · demo" if demo else "")
+    tags = ("moon,moneybag" if slot == "evening" else "sunny,moneybag")
+    print(body)
+    notify(title, body, click_url, tags=tags + ",chart_with_downwards_trend",
+           priority="high" if lowest_ids else "default", lowest=bool(lowest_ids))
+
+    # One tappable alert per product so the right store opens
+    for name, price_s, store, url, is_lowest in product_links:
+        tag = " ↓ lowest" if is_lowest else ""
+        notify(f"Buy · {name}", f"{price_s} at {store}{tag}\n{url}", url,
+               tags="link,shopping_bags", priority="high" if is_lowest else "default",
+               lowest=is_lowest)
+        print(f"buy  {name}: {price_s} @ {store}  {url}")
+
+    if search_deals:
+        for p in conn.execute("SELECT * FROM products ORDER BY id").fetchall():
+            if is_watch(p["query"] or ""):
+                continue
+            try:
+                deals = search_deal_feeds_for_product(conn, p)
+            except Exception as e:
+                print(f"#{p['id']} deals failed: {e}", file=sys.stderr)
+                continue
+            pname = short_name(p["name"] or p["query"], 6)
+            for d in deals:
+                price_bit = fmt_money(d["price"], d.get("currency") or "")
+                msg = f"{d['title']} — {price_bit}"
+                notify(f"Deal: {pname}", msg, d["link"], tags="shopping_bags,fire")
+                print(f"deal  {pname}: {msg}  {d['link']}")
+
+    if not demo:
+        meta_set(conn, report_meta_key(slot), now_sydney().strftime("%Y-%m-%d"))
+        conn.commit()
+    return body
+
+
+def cmd_daily_report(conn, a):
+    """
+    Two updates/day (Australia/Sydney):
+      morning — just after inferred store sale hour, else 00:00
+      evening — 18:00
+    Use --force [--slot morning|evening] to send immediately (demo).
+    """
+    sync(conn)
+    force = getattr(a, "force", False)
+    slot = getattr(a, "slot", None)
+    if force:
+        send_slot_report(conn, slot or "morning", refresh=True, search_deals=True, demo=True)
+        return
+    for s in ("morning", "evening"):
+        if slot and s != slot:
+            continue
+        if not report_due(conn, s):
+            want = morning_report_hour(conn) if s == "morning" else evening_report_hour()
+            print(f"{s} report not due (Sydney hour {now_sydney().hour}, runs at {want:02d}:00)")
+            continue
+        send_slot_report(conn, s, refresh=True, search_deals=True, demo=False)
+
+
+def cmd_morning_report(conn, a):
+    """Back-compat: morning slot only (or --force demo)."""
+    class _A:
+        force = getattr(a, "force", False)
+        slot = "morning"
+    cmd_daily_report(conn, _A())
 
 
 # ---------- CLI ----------
@@ -632,7 +1030,7 @@ def cmd_add(conn, a):
     if is_watch(target):
         url = None
     cur = conn.execute("INSERT INTO products(query,url,every,added) VALUES(?,?,?,?)",
-                       (target, url, a.every, datetime.now().isoformat(timespec="seconds")))
+                       (target, url, a.every, now_sydney_iso()))
     conn.commit()
     write_products(conn)
     p = conn.execute("SELECT * FROM products WHERE id=?", (cur.lastrowid,)).fetchone()
@@ -650,12 +1048,16 @@ def cmd_add(conn, a):
 
 
 def cmd_list(conn, a):
+    today = now_sydney().date()
     for p in conn.execute("SELECT * FROM products ORDER BY id"):
         low = conn.execute("SELECT price, store FROM prices WHERE product_id=? ORDER BY price LIMIT 1",
                            (p["id"],)).fetchone()
         last = datetime.fromtimestamp(p["last_checked"]).strftime("%Y-%m-%d %H:%M") if p["last_checked"] else "never"
+        stats = product_report_stats(conn, p["id"], today)
+        yday = fmt_money(stats["yesterday"]) if stats["yesterday"] is not None else "NA"
         print(f"#{p['id']} [{p['every']}] {p['name'] or p['query']}\n    now {p['last_price'] or '-'}"
-              f" | lowest {f'{low[0]:,.2f} at {low[1]}' if low else '-'} | checked {last}\n    {p['url'] or ''}")
+              f" | yesterday {yday} | lowest {f'{low[0]:,.2f} at {low[1]}' if low else '-'} | checked {last}\n"
+              f"    {p['url'] or ''}")
 
 
 def cmd_history(conn, a):
@@ -690,6 +1092,9 @@ def main(argv=None):
     s = sub.add_parser("every"); s.add_argument("id", type=int); s.add_argument("interval", choices=INTERVALS)
     s = sub.add_parser("history"); s.add_argument("id", type=int)
     s = sub.add_parser("check"); s.add_argument("--all", action="store_true")
+    s = sub.add_parser("morning-report"); s.add_argument("--force", action="store_true")
+    s = sub.add_parser("daily-report"); s.add_argument("--force", action="store_true")
+    s.add_argument("--slot", choices=("morning", "evening"), default=None)
     sub.add_parser("test-notify")
     a = ap.parse_args(argv)
     conn = connect()
@@ -707,6 +1112,10 @@ def main(argv=None):
         cmd_history(conn, a)
     elif a.cmd == "check":
         cmd_check(conn, a)
+    elif a.cmd == "morning-report":
+        cmd_morning_report(conn, a)
+    elif a.cmd == "daily-report":
+        cmd_daily_report(conn, a)
     elif a.cmd == "test-notify":
         notify("Price tracker", "Test alert: ₹999.00 at example.com", "https://example.com")
 

@@ -275,7 +275,81 @@ def test_ntfy_topic_from_env(env, monkeypatch):
 def test_workflow_runs_hourly_and_saves_history():
     wf = (t.HERE / ".github/workflows/track.yml").read_text()
     assert 'cron: "17 * * * *"' in wf and "python tracker.py check" in wf
+    assert "python tracker.py daily-report" in wf
     assert "secrets.NTFY_TOPIC" in wf and "git push" in wf and "prices.db" in wf
+
+
+def test_product_report_stats_today_yesterday_week_lowest(env):
+    conn = t.connect()
+    p = add(conn)
+    today = t.now_sydney().date()
+    yday = today.fromordinal(today.toordinal() - 1)
+    week = today.fromordinal(today.toordinal() - 3)
+    conn.execute("INSERT INTO prices(product_id,ts,store,url,price,currency) VALUES(?,?,?,?,?,?)",
+                 (p["id"], f"{week}T10:00:00", "a.com", "https://a.com/old", 400, "AUD"))
+    conn.execute("INSERT INTO prices(product_id,ts,store,url,price,currency) VALUES(?,?,?,?,?,?)",
+                 (p["id"], f"{yday}T10:00:00", "a.com", "https://a.com/yday", 380, "AUD"))
+    conn.execute("INSERT INTO prices(product_id,ts,store,url,price,currency) VALUES(?,?,?,?,?,?)",
+                 (p["id"], f"{today}T10:00:00", "a.com", "https://a.com/sony-deal", 350, "AUD"))
+    conn.commit()
+    stats = t.product_report_stats(conn, p["id"], today)
+    assert stats["today"] == 350 and stats["yesterday"] == 380 and stats["lowest"] == 350
+    assert stats["store"] == "a.com" and stats["url"] == "https://a.com/sony-deal"
+    assert abs(stats["week_avg"] - (400 + 380 + 350) / 3) < 0.01
+    body, lowest_ids, click, links = t.build_daily_report(conn, "morning", today)
+    assert "↓ lowest today" in body and "$350" in body and p["id"] in lowest_ids
+    assert "https://a.com/sony-deal" in body and click == "https://a.com/sony-deal"
+    assert links and links[0][3] == "https://a.com/sony-deal"
+    # no yesterday -> NA
+    conn.execute("DELETE FROM prices WHERE ts LIKE ?", (f"{yday}%",))
+    conn.commit()
+    # still lowest; add a higher older price so today isn't only row confusing week line
+    body, _ = t.build_morning_report(conn, today)
+    assert "↓ lowest today" in body
+
+
+def test_morning_report_hour_defaults_midnight_without_drop_pattern(env):
+    conn = t.connect()
+    assert t.morning_report_hour(conn) == 0
+    p = add(conn)
+    # drops always at 10:00 Sydney -> report hour 10
+    for i, price in enumerate([500, 480, 460, 440, 420]):
+        conn.execute("INSERT INTO prices(product_id,ts,store,price) VALUES(?,?,?,?)",
+                     (p["id"], f"2026-11-{10 + i:02d}T10:05:00", "shop-a.com", price))
+    conn.commit()
+    assert t.typical_store_sale_hours(conn).get("shop-a.com") == 10
+    assert t.morning_report_hour(conn) == 10
+
+
+def test_morning_report_force_notifies_and_searches_deals(env, monkeypatch):
+    env[ORIG] = ld_page("Sony WH-1000XM5", 299, "AUD")
+    env[OTHER] = ld_page("Sony WH-1000XM5 Headphones", 349, "AUD")
+    feed = "https://www.ozbargain.com.au/search/node/Sony%20WH-1000XM5/feed"
+    env[feed] = rss(("55", "Sony WH-1000XM5 $299 @ JB Hi-Fi", "https://jbhifi.com.au/p/sony", False))
+    env[FEED_ALL] = rss(("90", "Unrelated toaster $10 @ Kmart", "https://kmart.com.au/t", False))
+    t.PRODUCTS.write_text(f"{ORIG} | day\n")
+    sent = []
+    monkeypatch.setattr(t, "notify", lambda *a, **k: sent.append((a, k)))
+    t.main(["morning-report", "--force"])
+    body = " ".join(str(x) for x in sent)
+    assert "Price digest · morning" in body
+    assert "↓ lowest today" in body or "LOWEST PRICE" in body
+    assert "shop-a.com" in body and ORIG in body
+    assert any("Buy ·" in str(a) for a, _ in sent)
+    assert any("Deal:" in str(a) for a, _ in sent)
+    # --force is a demo: does not consume the daily morning slot
+    assert t.meta_get(t.connect(), "last_morning_report") is None
+
+
+def test_evening_report_due_at_6pm(env):
+    conn = t.connect()
+    assert t.evening_report_hour() == 18
+    noon = t.now_sydney().replace(hour=12, minute=0, second=0, microsecond=0)
+    six = noon.replace(hour=18)
+    assert not t.report_due(conn, "evening", now=noon)
+    assert t.report_due(conn, "evening", now=six)
+    t.meta_set(conn, "last_evening_report", six.strftime("%Y-%m-%d")); conn.commit()
+    assert not t.report_due(conn, "evening", now=six)
 
 
 # --- watch mode (every deal for a keyword) + country ---

@@ -14,7 +14,11 @@ cat > "$PLIST" <<EOF
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>local.price-tracker</string>
-  <key>ProgramArguments</key><array><string>$PY</string><string>$DIR/tracker.py</string><string>check</string></array>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>-c</string><string>$PY "$DIR/tracker.py" check; $PY "$DIR/tracker.py" daily-report</string></array>
+  <key>EnvironmentVariables</key><dict>
+    <key>TZ</key><string>Australia/Sydney</string>
+    <key>COUNTRY</key><string>AU</string>
+  </dict>
   <key>StartInterval</key><integer>3600</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>$DIR/run.log</string>
